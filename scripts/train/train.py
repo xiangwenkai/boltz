@@ -127,6 +127,13 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
     data_module = BoltzTrainingDataModule(data_config)
     model_module = cfg.model
 
+    ref_model_path = '/home/xiang_wenkai/.boltz/boltz1_conf.ckpt'
+    print(f"Loading ref model from {ref_model_path}")
+    ref_structure_module = type(model_module).load_from_checkpoint(
+        ref_model_path, map_location="cpu", strict=False, **(model_module.hparams)
+    ).structure_module
+
+    cfg.pretrained = '/home/xiang_wenkai/.boltz/boltz1_conf.ckpt'
     if cfg.pretrained and not cfg.resume:
         # Load the pretrained weights into the confidence module
         if cfg.load_confidence_from_trunk:
@@ -160,6 +167,7 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
 
         if cfg.load_confidence_from_trunk:
             os.remove(file_path)
+    model_module.ref_structure_module = ref_structure_module
 
     # Create checkpoint callback
     callbacks = []

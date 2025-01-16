@@ -587,6 +587,24 @@ class AtomDiffusion(Module):
         noise = torch.randn_like(atom_coords)
         noised_atom_coords = atom_coords + padded_sigmas * noise
 
+        try:
+            with torch.no_grad():
+                ref_denoised_atom_coords, _ = self.ref_structure_module.preconditioned_network_forward(
+                    noised_atom_coords,
+                    sigmas,
+                    training=True,
+                    network_condition_kwargs=dict(
+                        s_inputs=s_inputs,
+                        s_trunk=s_trunk,
+                        z_trunk=z_trunk,
+                        relative_position_encoding=relative_position_encoding,
+                        feats=feats,
+                        multiplicity=multiplicity,
+                    ),
+                )
+        except:
+            ref_denoised_atom_coords = None
+
         denoised_atom_coords, _ = self.preconditioned_network_forward(
             noised_atom_coords,
             sigmas,
@@ -604,6 +622,7 @@ class AtomDiffusion(Module):
         return dict(
             noised_atom_coords=noised_atom_coords,
             denoised_atom_coords=denoised_atom_coords,
+            ref_denoised_atom_coords=ref_denoised_atom_coords,
             sigmas=sigmas,
             aligned_true_atom_coords=atom_coords,
         )
@@ -618,6 +637,7 @@ class AtomDiffusion(Module):
         multiplicity=1,
     ):
         denoised_atom_coords = out_dict["denoised_atom_coords"]
+        ref_denoised_atom_coords = out_dict["ref_denoised_atom_coords"]
         noised_atom_coords = out_dict["noised_atom_coords"]
         sigmas = out_dict["sigmas"]
 
@@ -653,25 +673,53 @@ class AtomDiffusion(Module):
                 align_weights.detach().float(),
                 mask=resolved_atom_mask.detach().float(),
             )
+            ref_atom_coords_aligned_ground_truth = weighted_rigid_align(
+                atom_coords.detach().float(),
+                ref_denoised_atom_coords.detach().float(),
+                align_weights.detach().float(),
+                mask=resolved_atom_mask.detach().float(),
+            )
+
 
         # Cast back
+        ref_atom_coords_aligned_ground_truth = ref_atom_coords_aligned_ground_truth.to(
+            ref_denoised_atom_coords
+        )
         atom_coords_aligned_ground_truth = atom_coords_aligned_ground_truth.to(
             denoised_atom_coords
         )
 
         # weighted MSE loss of denoised atom positions
-        mse_loss = ((denoised_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(
-            dim=-1
-        )
-        mse_loss = torch.sum(
-            mse_loss * align_weights * resolved_atom_mask, dim=-1
+        mse_loss_w = ((denoised_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
+        mse_loss_l = ((denoised_atom_coords - ref_denoised_atom_coords) ** 2).sum(dim=-1)
+        mse_loss_w = torch.sum(
+            mse_loss_w * align_weights * resolved_atom_mask, dim=-1
         ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+        mse_loss_l = torch.sum(
+            mse_loss_l * align_weights * resolved_atom_mask, dim=-1
+        ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+        model_diff = mse_loss_w - mse_loss_l  # These are both LBS (as is t)
 
         # weight by sigma factor
         loss_weights = self.loss_weight(sigmas)
-        mse_loss = (mse_loss * loss_weights).mean()
+        mse_loss = (mse_loss_w * loss_weights).mean()
 
-        total_loss = mse_loss
+        with torch.no_grad():
+            ref_mse_loss_w = ((ref_denoised_atom_coords - ref_atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
+            ref_mse_loss_l = ((ref_denoised_atom_coords - ref_denoised_atom_coords) ** 2).sum(dim=-1)
+            ref_mse_loss_w = torch.sum(
+                ref_mse_loss_w * align_weights * resolved_atom_mask, dim=-1
+            ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+            ref_mse_loss_l = torch.sum(
+                ref_mse_loss_l * align_weights * resolved_atom_mask, dim=-1
+            ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+            ref_model_diff = ref_mse_loss_w - ref_mse_loss_l  # These are both LBS (as is t)
+        scale_term = -0.5 * 5000  # scale_term = -0.5 * args.beta_dpo
+        inside_term = scale_term * (model_diff - ref_model_diff)
+        # implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+        dpo_loss = -1 * F.logsigmoid(inside_term).mean()
+
+        total_loss = mse_loss + dpo_loss
 
         # proposed auxiliary smooth lddt loss
         lddt_loss = self.zero
@@ -688,7 +736,7 @@ class AtomDiffusion(Module):
             total_loss = total_loss + lddt_loss
 
         loss_breakdown = dict(
-            mse_loss=mse_loss,
+            mse_loss=mse_loss+dpo_loss,
             smooth_lddt_loss=lddt_loss,
         )
 
